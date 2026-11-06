@@ -313,6 +313,176 @@ class LiveTmux(unittest.TestCase):
         self.assertEqual(tsesh.session_states(), {})
 
 
+class FakeServer:
+    """A tmux server that may "restore" sessions when started.
+
+    Patches the module-level helpers TmuxBackend uses and records the order
+    of server starts and session creations.
+    """
+
+    def __init__(self, restores=(), scoped=True):
+        self.restores = set(restores)
+        self.scoped = scoped
+        self.running = False
+        self.sessions: set[str] = set()
+        self.calls: list[tuple[str, ...]] = []
+
+    def start(self, args):
+        if args[0] == "start-server":
+            self.sessions |= self.restores
+            self.running = bool(self.sessions)  # exit-empty
+        else:
+            self.sessions |= self.restores | {args[args.index("-s") + 1]}
+            self.running = True
+
+    def server_running(self):
+        return self.running
+
+    def scope(self, args):
+        self.calls.append(("scope", *args))
+        if self.scoped:
+            self.start(args)
+        return self.scoped
+
+    def tmux_cmd(self, *args, check=True, capture=True):
+        self.calls.append(("tmux", *args))
+        if args[0] == "has-session":
+            name = args[2].lstrip("=").removesuffix(":")
+            rc = 0 if self.running and name in self.sessions else 1
+        elif args[0] in ("start-server", "new-session"):
+            if args[0] == "new-session" and self.running:
+                assert args[3] not in self.sessions, "duplicate session"
+            self.start(args)
+            rc = 0
+        else:
+            rc = 0
+        return subprocess.CompletedProcess(args, rc, "", "")
+
+    def patched(self, testcase):
+        for name, fake in (
+            ("server_running", self.server_running),
+            ("start_server_in_own_scope", self.scope),
+            ("tmux_cmd", self.tmux_cmd),
+        ):
+            old = getattr(tsesh, name)
+            setattr(tsesh, name, fake)
+            testcase.addCleanup(setattr, tsesh, name, old)
+        return self
+
+    def verbs(self):
+        return [c[1] for c in self.calls]
+
+
+class ServerStartRestore(unittest.TestCase):
+    """A restoring tmux brings sessions back when the server starts."""
+
+    def test_restored_session_is_not_created(self):
+        fake = FakeServer(restores={"work"}).patched(self)
+        tsesh.TmuxBackend().create("work", "/", "make")
+        self.assertEqual(fake.sessions, {"work"})
+        self.assertNotIn("new-session", fake.verbs())
+        self.assertNotIn("send-keys", fake.verbs())
+
+    def test_connect_switches_to_restored_session(self):
+        fake = FakeServer(restores={"work"}).patched(self)
+        switched = []
+        old = tsesh.switch_or_attach
+        tsesh.switch_or_attach = switched.append
+        self.addCleanup(setattr, tsesh, "switch_or_attach", old)
+        self.assertEqual(tsesh.connect_resolved("work", "/", None), 0)
+        self.assertEqual(switched, ["work"])
+        self.assertNotIn("new-session", fake.verbs())
+
+    def test_other_session_is_created_after_restore(self):
+        fake = FakeServer(restores={"work"}).patched(self)
+        tsesh.TmuxBackend().create("fresh", "/", None)
+        self.assertEqual(fake.sessions, {"work", "fresh"})
+        self.assertEqual(fake.verbs().count("new-session"), 1)
+
+    def test_nothing_to_restore_still_creates_in_scope(self):
+        fake = FakeServer().patched(self)
+        tsesh.TmuxBackend().create("fresh", "/", None)
+        self.assertEqual(fake.sessions, {"fresh"})
+        self.assertEqual(
+            [c[:2] for c in fake.calls if c[0] == "scope"],
+            [("scope", "start-server"), ("scope", "new-session")],
+        )
+
+    def test_without_scope_falls_back_to_plain_tmux(self):
+        fake = FakeServer(scoped=False).patched(self)
+        tsesh.TmuxBackend().create("fresh", "/", None)
+        self.assertEqual(fake.sessions, {"fresh"})
+
+    def test_running_server_is_not_restarted(self):
+        fake = FakeServer().patched(self)
+        fake.running, fake.sessions = True, {"a"}
+        tsesh.TmuxBackend().create("b", "/", None)
+        self.assertEqual(fake.sessions, {"a", "b"})
+        self.assertFalse([c for c in fake.calls if c[0] == "scope"])
+
+
+class PickerStartsServer(unittest.TestCase):
+    def test_server_started_in_scope_before_listing(self):
+        fake = FakeServer(restores={"work"}).patched(self)
+        listed = []
+
+        def list_sessions(self):
+            listed.append(sorted(fake.sessions if fake.running else []))
+            return listed[-1]
+
+        old = tsesh.TmuxBackend.list_sessions
+        tsesh.TmuxBackend.list_sessions = list_sessions
+        self.addCleanup(setattr, tsesh.TmuxBackend, "list_sessions", old)
+        old_load = tsesh.load_config
+        tsesh.load_config = lambda: config()
+        self.addCleanup(setattr, tsesh, "load_config", old_load)
+        old_run = tsesh.subprocess.run
+        tsesh.subprocess.run = lambda *a, **k: subprocess.CompletedProcess(a, 1)
+        self.addCleanup(setattr, tsesh.subprocess, "run", old_run)
+        old_states = tsesh.session_states
+        tsesh.session_states = dict
+        self.addCleanup(setattr, tsesh, "session_states", old_states)
+
+        tsesh.pick_and_connect("tmux")
+        self.assertEqual(fake.calls[0], ("scope", "start-server"))
+        self.assertEqual(listed, [["work"]])
+
+    def test_running_server_is_left_alone(self):
+        fake = FakeServer().patched(self)
+        fake.running = True
+        tsesh.TmuxBackend().ensure_server()
+        self.assertEqual(fake.calls, [])
+
+
+@unittest.skipUnless(shutil.which("tmux"), "needs tmux")
+class PlainTmuxNoRestore(unittest.TestCase):
+    """Real tmux has no snapshot: start-server exits, create still works."""
+
+    def setUp(self):
+        self.socket = f"tsesh-plain-{os.getpid()}"
+        saved_path = os.environ.pop("TSESH_TMUX_SOCKET_PATH", None)
+        if saved_path is not None:
+            self.addCleanup(
+                os.environ.__setitem__, "TSESH_TMUX_SOCKET_PATH", saved_path
+            )
+        os.environ["TSESH_TMUX_SOCKET_NAME"] = self.socket
+        self.addCleanup(os.environ.pop, "TSESH_TMUX_SOCKET_NAME", None)
+        self.addCleanup(
+            subprocess.run,
+            ["tmux", "-L", self.socket, "kill-server"],
+            check=False,
+            capture_output=True,
+        )
+
+    def test_ensure_server_leaves_no_sessions(self):
+        tsesh.TmuxBackend().ensure_server()
+        self.assertEqual(tsesh.TmuxBackend().list_sessions(), [])
+
+    def test_create_makes_the_session(self):
+        tsesh.TmuxBackend().create("first", "/", None)
+        self.assertEqual(tsesh.TmuxBackend().list_sessions(), ["first"])
+
+
 class UserManagerCgroup(unittest.TestCase):
     """Only a server started under a user@ unit moves to its own scope.
 

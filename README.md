@@ -80,6 +80,13 @@ server under `user@.service` would end it about 10 s after the last logout
 unless lingering is on. macOS, containers and hosts without `systemd-run` also
 get plain `tmux`.
 
+With no server running, the picker starts one the same way (`start-server`)
+before it lists live sessions, so a tmux that restores saved sessions at server
+start shows them. When creating a session, tsesh checks again after starting
+the server and switches to the session if it came back, instead of running
+`new-session`. Plain tmux has no snapshot: `start-server` exits at once and
+nothing changes.
+
 ## Theme
 
 Catppuccin Mocha, hardcoded in `bin/tsesh` between `THEME BEGIN` / `THEME END`

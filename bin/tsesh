@@ -929,6 +929,7 @@ def _fzf_command(mode: str, query: str = "") -> list[str]:
 
 
 def fzf(mode: str = "all", query: str = "") -> int:
+    backend().ensure_server()
     mode = effective_initial_mode(mode)
     entries = "\n".join(entry.to_fzf_row() for entry in build_entries(mode))
     proc = subprocess.run(
@@ -943,6 +944,7 @@ def pick_and_connect(mode: str = "all", query: str = "") -> int:
     fzf writes its UI to /dev/tty when stdout is captured, so the picker
     still renders interactively while we keep the selection in-process.
     """
+    backend().ensure_server()
     mode = effective_initial_mode(mode)
     entries = "\n".join(entry.to_fzf_row() for entry in build_entries(mode))
     proc = subprocess.run(
@@ -1003,11 +1005,34 @@ class TmuxBackend:
             )
         update_last(name)
 
+    def ensure_server(self) -> None:
+        """Start the server if none runs, so a restoring tmux can bring back
+        its saved sessions before they are listed.
+
+        Plain tmux has nothing to restore: ``start-server`` with no sessions
+        exits at once (exit-empty) and the picker lists nothing, as before.
+        """
+        if server_running():
+            return
+        start = ("start-server",)
+        if not start_server_in_own_scope(start):
+            tmux_cmd(*start, check=False)
+
     def create(
         self, name: str, path: str, startup: str | None, split: str = ""
     ) -> None:
         new_session = ("new-session", "-d", "-s", name, "-c", path)
-        if server_running() or not start_server_in_own_scope(new_session):
+        if not server_running():
+            # Starting the server may restore NAME; new-session would then
+            # fail with "duplicate session". Start it first, then look again.
+            self.ensure_server()
+            if self.exists(name):
+                return
+        if server_running():
+            tmux_cmd(*new_session, capture=False)
+        elif not start_server_in_own_scope(new_session):
+            # The server exited again (nothing restored): start it with the
+            # session, in its own scope when that applies.
             tmux_cmd(*new_session, capture=False)
         if startup:
             tmux_cmd(
